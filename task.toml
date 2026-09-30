@@ -1,0 +1,88 @@
+name = "pipeline-corrosion"
+
+# The verifier reads only these paths from the agent's final environment. Must stay top-level:
+# nested under [verifier] the value is silently dropped and the verifier receives nothing.
+artifacts = [
+    "/app/predictor/src/",
+    "/app/predictor/build.sh",
+    "/app/data/",
+    "/app/out/",
+]
+
+[metadata]
+author_name = "anonymous"
+author_email = "anonymous"
+category = "ML"
+subcategory = "Training"
+tags = ["fortran", "glm", "poisson", "exposure", "pipeline-integrity"]
+languages = ["fortran"]
+difficulty = "advanced"
+expert_time_estimate_hours = 5
+
+difficulty_explanation = """
+Segment lengths in this export span three orders of magnitude — the shortest is under a hundred metres, the longest about forty kilometres — and the graded quantity is a COUNT over that length. The defect counts therefore have to be modelled against a log(length) offset. Fitting the observed rate, defects divided by length, is the obvious move and it is the wrong one: it treats a segment with one indication over sixty metres as evidence of the same weight as one with five hundred over thirty kilometres, so the fit is dominated by the noisiest, shortest segments.
+
+The data dictionary no longer does any of that reasoning for the agent. An earlier round of this task spelled the consequence out in the notes beside the columns, in effect writing down that a count is a count over its own length and that two otherwise identical segments will not have similar counts if one is sixty times longer. Spelling it out that way turned the crux into transcription: the offset is the whole of the difficulty, and a dictionary that names it hands the answer over before any modelling starts. The notes now record only how the export is cut, which is that segments are bounded by valves, road crossings and survey breaks and so are not a standard length, and both cohorts are cut the same way. The length column is still right there and the span is still three orders of magnitude, so nothing needed to reach the offset has been withheld; what has gone is being told what it implies.
+
+What makes this the load-bearing difficulty is that the wrong route looks entirely healthy. It produces a plausible model, sensible-looking coefficients and a respectable fit ON THE SEGMENTS IT WAS FITTED TO — the failure only appears when the predictions are scored as counts against a baseline that already knows the network-wide rate per kilometre. Measured across five generator seeds: modelling counts with the offset explains 0.402-0.475 of the baseline's deviance, while fitting the rate directly explains 0.062-0.230, against a bar of 0.30. Both were fitted with the same design matrix, the same solver and the same iteration count; the offset is the only difference.
+
+This is a quieter error than the class-imbalance one it replaces on our other tasks. Imbalance is conspicuous — count the classes and it announces itself — whereas nothing about this export says "you must use an offset". The exposure spread is stated in the data dictionary as a fact about how segments are bounded, and the consequence is left to the agent.
+
+The implementation sits on top of that. gfortran ships no linear algebra and the box is offline, so the iteratively reweighted least squares and the linear solve underneath it are the agent's to write — about a hundred lines against the intrinsics. That is real work but it is not the difficulty; an agent that writes a flawless solver and fits the rate still fails, and an agent that recognises the offset can clear the bar with a crude one.
+
+A per-segment frailty term stands for unmeasured condition — old coating damage, third-party interference, local drainage — so the counts are genuinely overdispersed and the achievable ceiling is well short of perfect. That keeps the bar from being a formality for a correct model while leaving it unreachable for an incorrect one.
+
+Where the data comes from. Both exports are synthetic and are produced by solution/generate_data.py, which ships. Defect counts are drawn from a negative binomial whose mean is the segment's length multiplied by a rate built from age, coating class, soil resistivity and cathodic protection, with the per-segment frailty above supplying the overdispersion. The segment lengths themselves are drawn across three orders of magnitude, which is what makes the offset load-bearing rather than cosmetic. Synthetic data is what makes the task gradeable at all, because the signed-off counts have to be known exactly to score against, and it is what makes the result honest: the length span is the only thing standing between a rate fit and a count fit, so a model that clears the bar has demonstrably handled exposure rather than some other artefact of a real export. Every calibration figure quoted above can be re-derived by running that generator.
+
+In a real business this job belongs to a pipeline integrity engineer, or the corrosion specialist they work with, at a transmission operator or the consultancy doing their integrity assessment. Ranking segments for in-line inspection from historical dig results is routine work for that role, and fitting counts without an exposure offset is a known and regularly missed hazard in exactly that setting, because the model it produces looks entirely reasonable on the segments it was fitted to.
+"""
+
+solution_explanation = """
+The reference (solution/solve.sh) installs src/main.f90 and runs the project's build script. It reads both exports with list-directed input, builds a nine-column design matrix — intercept, age, cathodic-protection potential, operating pressure, two coating dummies and three soil dummies, with fbe and sand as the baselines — and fits a Poisson GLM by iteratively reweighted least squares with log(length_km) as the offset.
+
+gfortran provides no linear algebra, so the normal equations are assembled directly and solved by Gaussian elimination with partial pivoting, written out in about thirty lines. Forty IRLS iterations with a small ridge on the diagonal are ample; the fit is well conditioned.
+
+Predictions are exp(x.b + log(length)) per segment, written as whitespace-delimited text. It explains 0.4070 of the baseline deviance on the shipped stretch against the 0.30 bar. The same code with the offset removed — fitting defects/length by least squares and multiplying back up — explains 0.0615, which is what the oracle_rate_ols arm checks.
+"""
+
+verification_explanation = """
+The verifier runs in its own container. It collects the agent's Fortran sources, the build script and the shipped export as artifacts, recompiles the project with gfortran and runs it, so the graded output is always the product of a clean build of the agent's own code. There is no dependency tree here and so no prebuilt binary and no stale-artifact problem: the model is written against the intrinsics, and the verifier image carries only gfortran and pytest.
+
+Recompiling means the verifier executes code the agent wrote, so that step is not done as root. test.sh hands the project to an unprivileged build user through setpriv with supplementary groups cleared and no-new-privileges set. Each run happens in its own session and its whole process group is torn down afterwards, then every process that user still owns is swept, so nothing the agent started is alive when the reward is written. The program's output is moved to a root-owned path and pytest reads that: pytest never runs the agent's binary itself, which would execute agent code as root in the container that decides the reward. The graded counts are baked into the image at /opt/golden, readable only by root, and the whole /tests mount is closed to the build user before anything untrusted starts — if it is still reachable the run is abandoned with reward 0 rather than graded. pytest runs with -P so the working directory stays off the import path, closing the /app/pytest.py shadow that would otherwise let agent code no-op the suite.
+
+Nine checks run. Six grade the shipped stretch: the export is unaltered (sha256), the header and two-column schema, one-to-one coverage of the surveyed segments, finite and non-negative counts, predictions that vary rather than being one number repeated, and the deviance explained reaching 0.30 against a baseline that knows only the network-wide rate per kilometre and each segment's length. That baseline is the point of the metric: respecting exposure at all is worth nothing, so the bar can only be cleared by covariates doing real work on counts.
+
+Three more grade a SECOND run against a stretch the agent has never seen, baked in at /opt/holdout and never present in any container the agent can reach. test.sh moves the first output aside root-only, swaps /app/data, recompiles and runs the same program again, then restores the agent's export byte-for-byte so the sha256 check still tests exactly what the agent left. Those three check that it quotes every segment in the stretch it was given, that the deviance stays above a slacker 0.20, and that the two runs do not produce identical numbers.
+
+That holdout stretch is generated under a DIFFERENT true intensity, not merely a different seed, and the reason is measured. A program emitting stored COUNTS fails all three checks either way. A program that stores the fitted COEFFICIENTS instead recomputes plausible-looking numbers on whatever file it is handed, so a holdout drawn from the same generator does not catch it: on the previous same-regime holdout the stored fit scored 0.4244 against the 0.20 bar while an honest refit scored 0.4232, which left the instruction's "it needs to fit whatever is sitting in /app/data" unenforced. Under the current regime — a lower baseline intensity, cathodic protection entering with the opposite sign, and the coating and soil rankings reversed — the stored fit scores -0.7566 and an honest refit 0.4182, so only a program that reads history.dat at run time clears the bar. The stretch is otherwise identical in format and columns, so nothing about it is visible to a program that does refit.
+
+The output the agent's build leaves at /app/out/predictions.dat is staged only if it is a regular file: the build runs unprivileged and cannot read /opt/golden, but it could drop a symlink there, and a plain move would preserve it for root-run pytest to dereference. Anything that is not a regular file is discarded and the run counts as having written nothing; the reads in test_outputs.py additionally open O_NOFOLLOW.
+
+The bar was placed between measured routes rather than by taste. Across five generator seeds the offset model explains 0.402-0.475 and the rate fit 0.062-0.230, with the bar at 0.30 between them. The oracle_rate_ols arm makes that runnable: it is the reference with the offset removed and nothing else changed, and it scores 0, failing both deviance checks while passing every structural one. solution/generate_data.py regenerates the shipped export byte for byte and solution/generate_holdout.py produces the holdout stretch, so the calibration is re-runnable rather than asserted.
+"""
+
+relevant_experience = """
+I authored the fleet predictive-maintenance task accepted into the previous edition of the benchmark and four of the Rust/ML tasks in this one, one of which has been accepted here. The judgement that shaped this task is a negative result from that batch: a task whose difficulty is a conspicuous property of the data, a steep class imbalance, gave itself away because counting the classes announces the problem before any modelling starts. What survives is an error that looks correct while you are making it. Fitting a rate rather than a count is that kind of error: it produces a healthy-looking model, and nothing in the export tells you to use an offset. I also kept the second axis out deliberately after measuring three candidates — a provenance trap, a budgeted selection decision and an interval-coverage check — and finding that none of them separated on this data; a second axis that does not discriminate is worse than one axis that does.
+"""
+
+[verifier]
+# Two compiles and two runs of the agent's program. gfortran is fast and there is no dependency
+# tree, so this is comfortable, but 1800 is the floor the platform requires.
+timeout_sec = 1800
+environment_mode = "separate"
+network_mode = "no-network"
+
+[agent]
+timeout_sec = 5400
+# Offline by design: the model is written against gfortran's intrinsics, and network access
+# would let the agent fetch a statistics library instead of implementing the fit.
+network_mode = "no-network"
+
+[environment]
+# Must be "public" on every task, offline ones included: this is the phase where the image is
+# built and the agent harness is installed.
+network_mode = "public"
+build_timeout_sec = 900
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
